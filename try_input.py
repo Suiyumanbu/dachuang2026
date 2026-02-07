@@ -13,3 +13,4 @@ if __name__ == '__main__':
     print(args.input1)
     print(args.input2)
     print(f"add them together and get:{args.input1+args.input2}")
+
