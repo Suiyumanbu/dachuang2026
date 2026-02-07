@@ -1,4 +1,5 @@
 from Bio import SeqIO
+import pandas as pd
 import numpy as np
 
 # 1. 读取FASTA文件
@@ -12,3 +13,6 @@ print("前三条：")
 print(sequences[0])
 print(sequences[1])
 print(sequences[2])
+
+data = pd.Series(sequences)
+print(data)
