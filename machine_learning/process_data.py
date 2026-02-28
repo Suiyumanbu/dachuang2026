@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore')
 plt.rcParams["font.sans-serif"] = ["SimHei"] # 正常显示中文
 plt.rcParams["axes.unicode_minus"] = False # 正常显示负号
 
-path=Path('D:\Python\dachuang2026')
+path=Path('/')
 amino_acids = 'ARNDCEQGHILKMFPSTWYV'
 all_dipeptides = [a + b for a in amino_acids for b in amino_acids]
 
