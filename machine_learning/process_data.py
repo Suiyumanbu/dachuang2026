@@ -1,165 +1,171 @@
-from Bio import SeqIO
-from Bio.SeqUtils.ProtParam import ProteinAnalysis
-import matplotlib.pyplot as plt
+import warnings
+import json
 from pathlib import Path
 from collections import Counter
+
 import pandas as pd
 import numpy as np
-import warnings
+import matplotlib.pyplot as plt
+from Bio import SeqIO
+from Bio.SeqUtils.ProtParam import ProteinAnalysis
 
+# 全局配置
 warnings.filterwarnings('ignore')
-plt.rcParams["font.sans-serif"] = ["SimHei"] # 正常显示中文
-plt.rcParams["axes.unicode_minus"] = False # 正常显示负号
+plt.rcParams["font.sans-serif"] = ["SimHei"]  # 正常显示中文
+plt.rcParams["axes.unicode_minus"] = False  # 正常显示负号
 
-path=Path('/')
-amino_acids = 'ARNDCEQGHILKMFPSTWYV'
-all_dipeptides = [a + b for a in amino_acids for b in amino_acids]
+DEFAULT_PATH = Path('D:/Python/dachuang2026')  # 显示项目路径
+AMINO_ACIDS = 'ARNDCEQGHILKMFPSTWYV'
+ALL_DIPEPTIDES = [a + b for a in AMINO_ACIDS for b in AMINO_ACIDS]  # 400种二肽组合
+
 
 def read_fasta(fname):
-    with open(fname, "r") as f:
-        records = ((rec.id, str(rec.seq))
-                   for rec in SeqIO.parse(fname, "fasta"))
+    """读取FASTA文件并转化为DataFrame"""
+    records = []
+    for rec in SeqIO.parse(fname, "fasta"):
+        records.append((rec.id, str(rec.seq).upper()))
+        # .upper()确保序列大写，避免后续处理中的大小写问题
     return pd.DataFrame(records, columns=["Id", "Sequence"])
 
+
 def get_dipeptide_freq_dict(seq):
+    """高效计算二肽频率"""
     if len(seq) < 2:
         return {}
     dipeptides = [seq[i:i + 2] for i in range(len(seq) - 1)]
     total = len(dipeptides)
-    freq_dict = Counter(dipeptides)
-    return {k: v / total for k, v in freq_dict.items()}
+    return {k: v / total for k, v in Counter(dipeptides).items()}
+
 
 def get_termini_composition(seq):
     """提取末端5个氨基酸的组成特征"""
     features = {}
-
-    # N端前5个氨基酸（如果长度足够）
     n_term = seq[:5] if len(seq) >= 5 else seq
-    for aa in amino_acids:
-        features[f'Nterm_{aa}'] = n_term.count(aa) / len(n_term) if n_term else 0
-
-    # C端后5个氨基酸（如果长度足够）
     c_term = seq[-5:] if len(seq) >= 5 else seq
-    for aa in amino_acids:
-        features[f'Cterm_{aa}'] = c_term.count(aa) / len(c_term) if c_term else 0
 
+    for aa in AMINO_ACIDS:
+        features[f'Nterm_{aa}'] = n_term.count(aa) / len(n_term) if n_term else 0
+        features[f'Cterm_{aa}'] = c_term.count(aa) / len(c_term) if c_term else 0
     return features
 
-def process_data(dic):
+
+def process_data(dic, feature_config=None):
     """
-    针对小样本数据的优化版特征工程
-    特征数控制在200维以内
+    针对肽毒性预测优化的特征工程（含二级结构语法修正与两亲性特征）
+    :param dic: 原始 DataFrame，需包含 'Id' (可选) 和 'Sequence' 列
+    :param feature_config: 字典类型，用于预测模式下对齐特征列
     """
-    # 1. 从Id列中提取标签
-    dic['toxicity'] = dic['Id'].apply(lambda x: x.split('|')[1])
-    dic=dic.drop(columns=['Id'])
-    # 2. 计算长度
+    # 1. 标签提取与清理
+    if 'Id' in dic.columns:
+        dic['toxicity'] = dic['Id'].apply(lambda x: x.split('|')[1] if '|' in x else '0')
+        dic = dic.drop(columns=['Id'])
+
+    # 确保序列为大写，防止计算出错
+    dic['Sequence'] = dic['Sequence'].str.upper()
+
+    # 2. 基础物理化学特征
     dic['length'] = dic['Sequence'].apply(len)
-    # 3. 计算质量，假设线性
-    df=pd.read_csv(path / 'data/amino_acids.csv')
-    """
-     'Amino Acids: Formula, Molecular Weight', WebQC.Org, 10 February 2026, https://zh.webqc.org/aminoacids.php
-    """
-    df.set_index('Called', inplace=True)
+
+    # 质量计算优化：使用字典映射提升速度
+    df_aa = pd.read_csv(DEFAULT_PATH / 'data/amino_acids.csv').set_index('Called')
+    mass_dict = df_aa['Mass'].to_dict()
     hydrone_mass = 18.01528
+
     dic['mass'] = dic['Sequence'].apply(
-        lambda seq: sum(df.loc[aa, 'Mass'] for aa in seq) - (len(seq) - 1) * hydrone_mass
+        lambda seq: sum(mass_dict.get(aa, 0) for aa in seq) - (len(seq) - 1) * hydrone_mass
     )
-    # 4. 创建ProteinAnalysis对象缓存（关键优化！）
-    analyzers = dic['Sequence'].apply(ProteinAnalysis)
 
-    # 5. 计算疏水性（GRAVY）
-    dic['hydrophobicity'] = analyzers.apply(lambda x: x.gravy())
+    # 3. 创建 ProteinAnalysis 对象缓存（增加空序列检查）
+    analyzers = dic['Sequence'].apply(lambda x: ProteinAnalysis(x) if len(x) > 0 else None)
 
-    # 6. 计算等电点（整个序列，不是平均！）
-    dic['isoelectric_point'] = analyzers.apply(lambda x: x.isoelectric_point())
+    # 4. 理化指标计算
+    dic['hydrophobicity'] = analyzers.apply(lambda x: x.gravy() if x else 0)
+    dic['isoelectric_point'] = analyzers.apply(lambda x: x.isoelectric_point() if x else 7.0)
+    dic['charge_at_pH7.4'] = analyzers.apply(lambda x: x.charge_at_pH(7.4) if x else 0.0)
 
-    # 7. 计算人体pH下的电荷
-    dic['charge_at_pH7.4'] = analyzers.apply(lambda x: x.charge_at_pH(7.4))
+    # 5. 二级结构特征（语法修正版）
+    # 获取 (helix, turn, sheet) 元组列表
+    ss_results = analyzers.apply(lambda x: x.secondary_structure_fraction() if x else (0.0, 0.0, 0.0))
+    # 转换为 DataFrame 并合并，确保索引对齐
+    ss_df = pd.DataFrame(ss_results.tolist(), columns=['helix', 'turn', 'sheet'], index=dic.index)
+    dic = pd.concat([dic, ss_df], axis=1)
 
-    # 8. 计算二级结构倾向
-    ss_fractions = analyzers.apply(lambda x: x.secondary_structure_fraction())
-    dic['helix'] = ss_fractions.apply(lambda x: x[0])  # α-螺旋
-    dic['turn'] = ss_fractions.apply(lambda x: x[1])   # 转角
-    dic['sheet'] = ss_fractions.apply(lambda x: x[2])  # β-折叠
+    # 6. 两亲性模拟特征 (新增)
+    # 通过比较序列两端的疏水性差异来模拟两亲性
+    dic['amphiphilicity_index'] = dic['Sequence'].apply(
+        lambda seq: abs(ProteinAnalysis(seq[:len(seq) // 2]).gravy() -
+                        ProteinAnalysis(seq[len(seq) // 2:]).gravy()) if len(seq) >= 4 else 0.0
+    )
 
-    # 9. 计算氨基酸组成
-    for aa in amino_acids:
-        dic[f'comp_{aa}'] = dic['Sequence'].apply(lambda seq, a=aa: seq.count(a) / len(seq))
+    # 7. 氨基酸组成频率 (AAC)
+    for aa in AMINO_ACIDS:
+        dic[f'comp_{aa}'] = dic['Sequence'].apply(lambda seq: seq.count(aa) / len(seq) if len(seq) > 0 else 0)
 
-    # 10. 计算二肽频率
-    all_freqs = []
-    for seq in dic['Sequence']:
-        all_freqs.append(get_dipeptide_freq_dict(seq))
+    # 8. 二肽频率 (DPC) 与特征对齐逻辑
+    all_freqs = [get_dipeptide_freq_dict(seq) for seq in dic['Sequence']]
 
-    # 计算每个二肽的方差
-    dipeptide_variance = {}
-    for dip in all_dipeptides:
-        values = [freq.get(dip, 0) for freq in all_freqs]
-        if np.var(values) > 0:  # 只保留有变化的特征
-            dipeptide_variance[dip] = np.var(values)
+    if feature_config is None:
+        # 训练模式：计算方差并筛选前 50 个特征
+        dipeptide_variance = {}
+        for dip in ALL_DIPEPTIDES:
+            vals = [f.get(dip, 0) for f in all_freqs]
+            if np.var(vals) > 0:
+                dipeptide_variance[dip] = np.var(vals)
 
-    # 选择方差最大的前50个二肽
-    top_dipeptides = sorted(dipeptide_variance.items(),
-                            key=lambda x: x[1], reverse=True)[:50]
-    selected_dipeptides = [d[0] for d in top_dipeptides]
+        top_dips = sorted(dipeptide_variance.items(), key=lambda x: x[1], reverse=True)[:50]
+        selected_dipeptides = [d[0] for d in top_dips]
+        current_config = {'top_dipeptides': selected_dipeptides}
+    else:
+        # 预测模式：使用传入的配置，确保列名一致
+        selected_dipeptides = feature_config.get('top_dipeptides', [])
+        current_config = feature_config
 
-    # 计算选中的二肽特征
     for dip in selected_dipeptides:
-        dic[f'dip_{dip}'] = [freq.get(dip, 0) for freq in all_freqs]
+        dic[f'dip_{dip}'] = [f.get(dip, 0) for f in all_freqs]
 
-    # 11. 理化分组特征简化版
-    property_groups = {
-        'hydrophobic': 'AILMFWYV',  # 疏水
-        'hydrophilic': 'RKNDEQ',  # 亲水
-        'neutral': 'GSTCP',  # 中性
-        'charged': 'KRHDE',  # 带电
-    }
+    # 9. 序列复杂度与分组特征
+    dic['seq_complexity'] = dic['Sequence'].apply(lambda seq: len(set(seq)) / len(seq) if len(seq) > 0 else 0)
+    dic['charged_ratio'] = dic['Sequence'].apply(
+        lambda seq: sum(seq.count(aa) for aa in 'KRHDE') / len(seq) if len(seq) > 0 else 0
+    )
 
-    # 计算每组氨基酸的整体比例
-    for group_name, aas in property_groups.items():
-        dic[f'group_{group_name}_ratio'] = dic['Sequence'].apply(
-            lambda seq: sum(seq.count(aa) for aa in aas) / len(seq)
+    # 10. 末端组成特征合并优化
+    termini_features = dic['Sequence'].apply(get_termini_composition)
+    termini_df = pd.DataFrame(termini_features.tolist(), index=dic.index)
+    dic = pd.concat([dic, termini_df], axis=1)
+
+    # 11. 毒性相关 Motif
+    toxic_motifs = ['RR', 'KK', 'RK', 'KR', 'CXC', 'CC', 'RGD']
+    for motif in toxic_motifs:
+        dic[f'motif_{motif}'] = dic['Sequence'].apply(
+            lambda seq: seq.count(motif) / max(1, len(seq) - len(motif) + 1)
         )
 
-    # 12. 序列复杂度分析
-    dic['seq_complexity'] = dic['Sequence'].apply(
-        lambda seq: len(set(seq)) / len(seq)  # 运用集合类型计算独特氨基酸比例
-    )
-    dic['charged_ratio'] = dic['Sequence'].apply(
-        lambda seq: sum(seq.count(aa) for aa in 'KRHDE') / len(seq)  # 带电氨基酸比例连带分析
-    )
-
-    # 13. 末端特征
-    termini_features = dic['Sequence'].apply(get_termini_composition)
-    termini_df = pd.DataFrame(termini_features.tolist())
-
-    # 添加末端特征到主DataFrame
-    for col in termini_df.columns:
-        dic[col] = termini_df[col].values
-
-    # 14. 简单已知毒性相关特征
-    toxic_motifs = ['RR', 'KK', 'RK', 'KR', 'CXC', 'CC', 'RGD', 'KGD']
-    for motif in toxic_motifs:
-        if len(motif) == 2:  # 二肽
-            dic[f'motif_{motif}'] = dic['Sequence'].apply(
-                lambda seq: seq.count(motif) / max(1, len(seq) - 1)
-            )
-        else:  # 三肽或其他
-            dic[f'motif_{motif}'] = dic['Sequence'].apply(
-                lambda seq: seq.count(motif) / max(1, len(seq) - len(motif) + 1)
-            )
-
-    # 15. 输出简单的统计信息
-    print(f"\n处理完成！")
-    print(f"样本数: {len(dic)}")
+    # 输出统计信息
+    print(f"处理完成！样本数: {len(dic)}")
     feature_cols = [col for col in dic.columns if col not in ['Sequence', 'toxicity']]
-    print(f"特征数: {len(feature_cols)}")
-    print(f"样本/特征比: {len(dic) / len(feature_cols):.1f}:1")
+    print(f"特征维度: {len(feature_cols)}")
 
-    return dic
+    return dic, current_config
+
 
 if __name__ == "__main__":
-    train_data = read_fasta(path / 'data/test2.fasta')
-    processed_train = process_data(train_data)
-    processed_train.to_csv(path / 'data/processed_test2.csv', index=False)
+    # 执行流程
+    print("开始读取数据...")
+    dic = read_fasta(DEFAULT_PATH / 'data/test2.fasta')
+    print(dic.head())
+
+    print("\n开始处理数据...")
+    processed_train, train_config = process_data(dic)
+    print(processed_train.head())
+
+    # 保存结果
+    output_csv_path = DEFAULT_PATH / 'data/processed_train_data_done.csv'
+    output_json_path = DEFAULT_PATH / 'data/feature_config.json'
+
+    processed_train.to_csv(output_csv_path, index=False)
+    with open(output_json_path, 'w') as f:
+        json.dump(train_config, f)
+
+    print(f"\n数据已保存至:\nCSV: {output_csv_path}\nJSON: {output_json_path}")
+    print(f"最终数据形状: {processed_train.shape}")
